@@ -21,4 +21,4 @@ A full-stack geofencing and real-time vehicle alert application.
 
 ## Current Status
 
-Initial project setup and database connectivity.
+Added geofencing  database schema and migrations.
