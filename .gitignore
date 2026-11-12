@@ -1,0 +1,22 @@
+# Environment
+.env
+*.env
+# Go
+/backend/bin/
+/backend/tmp/
+
+# Node
+/frontend/node_modules/
+/frontend/dist/
+/frontend/.vite/
+
+# Logs
+*.log
+
+# Windows and macOS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
