@@ -54,4 +54,9 @@ docker compose up --build
 - WebSocket Alerts: `ws://localhost:8080/ws/alerts`
 - Health Check: `http://localhost:8080/health`
 
+## Video Solution Link
+
+[Solution Video](https://drive.google.com/file/d/1zMC_ig03dogWJ2u3wQdFzG-3zHjJwbO0/view?usp=sharing)
+
+
 See [SETUP.md](./SETUP.md) for local development setup, architecture design decisions, API `curl` examples, and deployment instructions.
