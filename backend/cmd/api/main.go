@@ -2,119 +2,137 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"mapup-geofencing/internal/config"
+	"mapup-geofencing/internal/database"
+	"mapup-geofencing/internal/handlers"
+	"mapup-geofencing/internal/repository"
+	"mapup-geofencing/internal/services"
+	"mapup-geofencing/internal/websocket"
 )
 
 func main() {
-	databaseURL := os.Getenv("DATABASE_URL")
-	if databaseURL == "" {
-		log.Fatal("DATABASE_URL environment variable is required")
-	}
+	cfg := config.Load()
 
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		10*time.Second,
-	)
+	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := database.Connect(rootCtx, cfg.DatabaseURL)
 	if err != nil {
-		log.Fatal("Could not create database pool: ", err)
+		log.Fatalf("database connection failed: %v", err)
 	}
 	defer pool.Close()
 
-	if err := pool.Ping(ctx); err != nil {
-		log.Fatal("Could not connect to database: ", err)
+	if err := database.RunMigrations(rootCtx, pool); err != nil {
+		log.Fatalf("database migration failed: %v", err)
 	}
 
-	log.Println("Connected to PostgreSQL successfully")
+	geofenceRepo := repository.NewGeofenceRepository(pool)
+	vehicleRepo := repository.NewVehicleRepository(pool)
+	locationRepo := repository.NewLocationRepository(pool)
+	alertRepo := repository.NewAlertRepository(pool)
 
-	router := gin.New()
-	router.Use(gin.Logger(), gin.Recovery(), corsMiddleware())
+	wsHub := websocket.NewHub(cfg.AllowedOrigins)
+	go wsHub.Run()
 
-	router.GET("/health", func(c *gin.Context) {
-		started := time.Now()
+	alertService := services.NewAlertService(alertRepo, wsHub, 4, 1024)
 
-		c.JSON(http.StatusOK, gin.H{
-			"status": "ok",
-			"time_ns": strconv.FormatInt(
-				time.Since(started).Nanoseconds(), 10,
-			),
-		})
-	})
+	rateLimiter := handlers.NewIPRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
+	defer rateLimiter.Stop()
 
-	router.GET("/health/db", func(c *gin.Context) {
-		started := time.Now()
+	healthHandler := handlers.NewHealthHandler(pool)
+	geofenceHandler := handlers.NewGeofenceHandler(geofenceRepo)
+	vehicleHandler := handlers.NewVehicleHandler(vehicleRepo, locationRepo, alertService)
+	alertHandler := handlers.NewAlertHandler(alertRepo)
 
-		queryCtx, queryCancel := context.WithTimeout(
-			c.Request.Context(),
-			3*time.Second,
-		)
-		defer queryCancel()
+	router := buildRouter(cfg, healthHandler, geofenceHandler, vehicleHandler, alertHandler, wsHub, rateLimiter)
 
-		var version string
-		err := pool.QueryRow(
-			queryCtx,
-			"SELECT PostGIS_Full_Version()",
-		).Scan(&version)
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
-		elapsed := strconv.FormatInt(
-			time.Since(started).Nanoseconds(), 10,
-		)
-
-		if err != nil {
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"status":  "error",
-				"error":   "Database check failed",
-				"time_ns": elapsed,
-			})
-			return
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("API server listening on :%s", cfg.Port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
 		}
+	}()
 
-		c.JSON(http.StatusOK, gin.H{
-			"status":          "connected",
-			"postgis_version": version,
-			"time_ns":         elapsed,
-		})
-	})
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	log.Println("Backend running at http://localhost:8080")
-
-	if err := router.Run(":8080"); err != nil {
-		log.Fatal("Server failed: ", err)
+	select {
+	case sig := <-sigCh:
+		log.Printf("received signal %s, shutting down gracefully...", sig)
+	case err := <-serverErr:
+		log.Fatalf("server error: %v", err)
 	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+	}
+	alertService.Shutdown(shutdownCtx)
+	wsHub.Shutdown()
+	log.Println("server stopped cleanly")
 }
 
-func corsMiddleware() gin.HandlerFunc {
-	return func(c *gin.Context) {
-		origin := c.GetHeader("Origin")
+func buildRouter(
+	cfg config.Config,
+	healthHandler *handlers.HealthHandler,
+	geofenceHandler *handlers.GeofenceHandler,
+	vehicleHandler *handlers.VehicleHandler,
+	alertHandler *handlers.AlertHandler,
+	wsHub *websocket.Hub,
+	rateLimiter *handlers.IPRateLimiter,
+) http.Handler {
+	r := chi.NewRouter()
 
-		if origin == "http://localhost:5173" {
-			c.Header("Access-Control-Allow-Origin", origin)
-			c.Header("Vary", "Origin")
-		}
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Recoverer)
+	r.Use(handlers.CORS(cfg.AllowedOrigins))
+	r.Use(handlers.RequestLogger)
+	r.Use(handlers.APIKeyAuth(cfg.APIKey))
 
-		c.Header(
-			"Access-Control-Allow-Headers",
-			"Content-Type, Authorization",
-		)
-		c.Header(
-			"Access-Control-Allow-Methods",
-			"GET, POST, PUT, PATCH, DELETE, OPTIONS",
-		)
+	r.NotFound(handlers.NotFoundHandler)
+	r.MethodNotAllowed(handlers.MethodNotAllowedHandler)
 
-		if c.Request.Method == http.MethodOptions {
-			c.AbortWithStatus(http.StatusNoContent)
-			return
-		}
+	r.Get("/health", healthHandler.Check)
 
-		c.Next()
-	}
+	r.Post("/geofences", geofenceHandler.Create)
+	r.Get("/geofences", geofenceHandler.List)
+
+	r.Post("/vehicles", vehicleHandler.Create)
+	r.Get("/vehicles", vehicleHandler.List)
+	r.With(rateLimiter.Middleware).Post("/vehicles/location", vehicleHandler.UpdateLocation)
+	r.Get("/vehicles/location/{vehicle_id}", vehicleHandler.GetLocation)
+
+	r.Post("/alerts/configure", alertHandler.Configure)
+	r.Get("/alerts", alertHandler.List)
+	r.Get("/alerts/history", alertHandler.ListRecentEvents)
+	r.Delete("/alerts/{alert_id}", alertHandler.Delete)
+
+	r.Get("/violations/history", alertHandler.ListViolations)
+
+	r.Get("/ws/alerts", wsHub.ServeWS)
+
+	return r
 }
